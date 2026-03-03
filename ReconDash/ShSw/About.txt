@@ -1,0 +1,1 @@
+This is a transitional revamp of spinjrock's kn1gh7 plugin.
