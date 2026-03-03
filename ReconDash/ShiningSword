@@ -1,4 +1,7 @@
 #!/bin/python3
+
+# Credit to Spinjrock's "Kn1gh7" plugin
+
 import sys
 import auparse
 import logging
