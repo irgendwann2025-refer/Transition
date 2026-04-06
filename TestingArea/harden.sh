@@ -1,87 +1,121 @@
 #!/bin/bash
 
-# --- 1. User Input for Whitelisting & Ports ---
-read -p "Enter Whitelist IPs (comma-separated): " WHITELIST
-read -p "Enter TCP Ports to open (comma-separated): " TCP_PORTS
-read -p "Enter UDP Ports to open (comma-separated): " UDP_PORTS
+# Ensure script is run as root
+if [ "$EUID" -ne 0 ]; then 
+  echo "Please run as root"
+  exit
+fi
 
-# --- 2. Flush & Initial Setup ---
-sudo iptables -F
-sudo iptables -X
-sudo ip6tables -F
-sudo ip6tables -X
+# Define Log Locations
+SYSLOG="/var/log/syslog"
+KERNLOG="/var/log/kern.log"
 
-# 1. Allow all traffic coming IN on the loopback interface
-sudo iptables -A INPUT -i lo -j ACCEPT
- 
-# 2. Allow all traffic going OUT on the loopback interface
-sudo iptables -A OUTPUT -o lo -j ACCEPT
+# --- Function: Apply Updated Ruleset ---
+apply_updated_rules() {
+    # 1. Flush & Reset
+    iptables -F
+    iptables -X
+    iptables -Z
+    
+    # 2. Default Policies
+    iptables -P INPUT DROP
+    iptables -P FORWARD DROP
+    iptables -P OUTPUT ACCEPT
 
-# State Tracking: Allow packets from established and related connections
-# This ensures that once a connection is started, the back-and-forth traffic is allowed.
-sudo iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    # 3. Basic Connectivity
+    iptables -A INPUT -i lo -j ACCEPT
+    iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
 
-# --- 3. Whitelist (Infrastructure & Admin) ---
-# Applies the provided IPs to both Source and Destination as per your original rules
-IFS=',' read -ra ADDR <<< "$WHITELIST"
-for ip in "${ADDR[@]}"; do
-    sudo iptables -A INPUT -s $ip -j ACCEPT
-    sudo iptables -A INPUT -d $ip -j ACCEPT
+    # 4. Bogon/Multicast Filtering
+    iptables -A INPUT -s 224.0.0.0/4 -j DROP
+    iptables -A INPUT -d 224.0.0.0/4 -j DROP
+    iptables -A INPUT -s 240.0.0.0/5 -j DROP
+    iptables -A INPUT -d 0.0.0.0/8 -j DROP
+    iptables -A INPUT -d 239.255.255.0/24 -j DROP
+    iptables -A INPUT -d 255.255.255.255 -j DROP
+
+    # 5. ICMP Restrictions
+    iptables -A INPUT -p icmp --icmp-type echo-request -j LOG --log-prefix "ICMP Attempt: " --log-level 4
+    iptables -A INPUT -p icmp --icmp-type echo-request -j REJECT
+    iptables -A INPUT -p icmp --icmp-type address-mask-request -j LOG --log-prefix "Address-Mask Drop: " --log-level 4
+    iptables -A INPUT -p icmp --icmp-type address-mask-request -j DROP
+    iptables -A INPUT -p icmp --icmp-type timestamp-request -j LOG --log-prefix "Timestamp Drop: " --log-level 4
+    iptables -A INPUT -p icmp --icmp-type timestamp-request -j DROP
+    iptables -A INPUT -p icmp -m limit --limit 1/second -j ACCEPT
+
+    # 6. Invalid Packets
+    iptables -A INPUT -m state --state INVALID -j LOG --log-prefix "Invalid Drop: " --log-level 4
+    iptables -A INPUT -m state --state INVALID -j DROP
+    iptables -A FORWARD -m state --state INVALID -j LOG --log-prefix "Forward Invalid Drop: " --log-level 4
+    iptables -A FORWARD -m state --state INVALID -j DROP
+    iptables -A OUTPUT -m state --state INVALID -j LOG --log-prefix "OUTPUT Invalid Drop: " --log-level 4
+    iptables -A OUTPUT -m state --state INVALID -j DROP
+
+    # 7. Portscan & SSH Protection
+    iptables -A INPUT -p tcp --dport 139 -m recent --name portscan --set -j LOG --log-prefix "portscan:" --log-level 4
+    iptables -A INPUT -p tcp --dport 139 -m recent --name portscan --set -j DROP
+    iptables -A INPUT -m recent --name portscan --rcheck --seconds 86400 -j DROP
+    
+    iptables -A INPUT -p tcp --dport 22 -m recent --name sshattempt --set -j LOG --log-prefix "SSH ATTEMPT: " --log-level 4
+    iptables -A INPUT -p tcp --dport 22 -m recent --name sshattempt --set -j REJECT --reject-with tcp-reset
+    iptables -A INPUT -p tcp -m recent --name sshattempt --rcheck --seconds 86400 -j DROP
+
+    # 8. Allowed Services (DNS/NTP)
+    iptables -A INPUT -p tcp --dport 53 -j ACCEPT
+    iptables -A INPUT -p udp --dport 53 -j ACCEPT
+    iptables -A INPUT -p udp --dport 123 -j ACCEPT
+
+    # 9. Final Reject
+    iptables -A INPUT -j REJECT
+    
+    # Save to user downloads as requested
+    mkdir -p /home/$SUDO_USER/Downloads
+    iptables-save > /home/$SUDO_USER/Downloads/iptables_new_rules.txt
+    chown $SUDO_USER:$SUDO_USER /home/$SUDO_USER/Downloads/iptables_new_rules.txt
+}
+
+# --- Main Whiptail Loop ---
+while true; do
+    CHOICE=$(whiptail --title "Firewall Management" --menu "Select an option" 18 60 8 \
+        "1" "Write New Rule & Refresh" \
+        "2" "Display All Active Rules" \
+        "3" "Show LOG Save Locations" \
+        "4" "Call Syslogs (Recent Logs)" \
+        "5" "Test Firewall Operation" \
+        "6" "Exit" 3>&1 1>&2 2>&3)
+
+    case $CHOICE in
+        1)
+            NEW_RULE=$(whiptail --inputbox "Enter custom rule (e.g., -A INPUT -p tcp --dport 80 -j ACCEPT):" 10 60 3>&1 1>&2 2>&3)
+            if [ ! -z "$NEW_RULE" ]; then
+                apply_updated_rules
+                iptables $NEW_RULE
+                whiptail --msgbox "Rules flushed, renewed, and custom rule applied." 10 60
+            fi
+            ;;
+        2)
+            RULES=$(iptables -L -n -v)
+            whiptail --title "Active Rules" --msgbox "$RULES" 20 80
+            ;;
+        3)
+            whiptail --title "Audit Info" --msgbox "LOG rules are directed to:\n\n1. Syslog: $SYSLOG\n2. Kernel Log: $KERNLOG" 12 60
+            ;;
+        4)
+            RECENT_LOGS=$(grep "iptables" $SYSLOG | tail -n 20)
+            if [ -z "$RECENT_LOGS" ]; then RECENT_LOGS="No firewall logs found."; fi
+            whiptail --title "Recent Firewall Logs" --msgbox "$RECENT_LOGS" 20 90
+            ;;
+        5)
+            # Test: Check if loopback is open and SSH rate limiting rule exists
+            LO_TEST=$(iptables -L INPUT -n | grep -i "ACCEPT" | grep "lo")
+            if [ ! -z "$LO_TEST" ]; then
+                whiptail --msgbox "Self-Test PASSED: Loopback traffic is allowed and chains are active." 10 60
+            else
+                whiptail --msgbox "Self-Test FAILED: Loopback traffic not detected in rules." 10 60
+            fi
+            ;;
+        6|*)
+            exit 0
+            ;;
+    esac
 done
-
-# --- 4. Bogon/Multicast Filtering ---
-sudo iptables -A INPUT -s 224.0.0.0/4 -j DROP
-sudo iptables -A INPUT -d 224.0.0.0/4 -j DROP
-sudo iptables -A INPUT -s 240.0.0.0/5 -j DROP
-sudo iptables -A INPUT -d 240.0.0.0/5 -j DROP
-sudo iptables -A INPUT -s 0.0.0.0/8 -j DROP
-sudo iptables -A INPUT -d 0.0.0.0/8 -j DROP
-sudo iptables -A INPUT -s 239.255.255.0/24 -j DROP
-sudo iptables -A INPUT -d 239.255.255.0/24 -j DROP
-sudo iptables -A INPUT -s 255.255.255.255 -j DROP
-sudo iptables -A INPUT -d 255.255.255.255 -j DROP
-
-# --- 5. Logging & Rate Limiting ---
-sudo iptables -A INPUT -p icmp --icmp-type echo-request -j LOG --log-prefix "ICMP Attempt: " --log-level 4
-sudo iptables -A INPUT -p tcp --tcp-flags RST RST -m limit --limit 2/second --limit-burst 2 -j ACCEPT
-
-# --- 6. Honeyport & Portscan Detection (Forward/Input) ---
-sudo iptables -A FORWARD -p tcp --dport 139 -m recent --name portscan --set -j LOG --log-prefix "portscan:" --log-level 4
-sudo iptables -A FORWARD -p tcp --dport 139 -m recent --name portscan --set -j DROP
-sudo iptables -A INPUT -m recent --name portscan --rcheck --seconds 86400 -j DROP
-sudo iptables -A INPUT -m recent --name portscan --remove
-
-# --- 7. SSH Brute Force & Service Ports ---
-sudo iptables -A INPUT -p tcp --dport 22 -m recent --name sshattempt --set -j LOG --log-prefix "SSH ATTEMPT: " --log-level 4
-sudo iptables -A INPUT -p tcp --dport 22 -m recent --name sshattempt --rcheck --seconds 86400 -j DROP
-
-# Open TCP Ports
-IFS=',' read -ra T_PORTS <<< "$TCP_PORTS"
-for port in "${T_PORTS[@]}"; do
-    sudo iptables -A INPUT -p tcp --dport $port -j ACCEPT
-done
-
-# Open UDP Ports
-IFS=',' read -ra U_PORTS <<< "$UDP_PORTS"
-for port in "${U_PORTS[@]}"; do
-    sudo iptables -A INPUT -p udp --dport $port -j ACCEPT
-done
-
-# --- 8. State Tracking & Invalid Packet Drops ---
-sudo iptables -A FORWARD -m state --state INVALID -j LOG --log-prefix "Forward Invalid Drop: " --log-level 4
-sudo iptables -A FORWARD -m state --state INVALID -j DROP
-sudo iptables -A OUTPUT -m state --state INVALID -j LOG --log-prefix "OUTPUT Invalid Drop: " --log-level 4
-sudo iptables -A OUTPUT -m state --state INVALID -j DROP
-
-# Portscan cleanup in Forward
-sudo iptables -A FORWARD -m recent --name portscan --rcheck --seconds 86400 -j DROP
-sudo iptables -A FORWARD -m recent --name portscan --remove
-
-# --- 9. Final Policies & Save ---
-sudo iptables -A INPUT -j REJECT
-sudo iptables -A FORWARD -j REJECT
-sudo iptables -A OUTPUT -j ACCEPT
-sudo ip6tables -A INPUT -j DROP
-
-sudo iptables-save | sudo tee /etc/iptables/rules.v4
-sudo ip6tables-save | sudo tee /etc/iptables/rules.v6
