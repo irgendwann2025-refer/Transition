@@ -86,9 +86,32 @@ while true; do
     esac
 done
 
+# --- NEW: Gold Team Account Provision ---
+echo -e "\n--- STAGE 2: GOLD TEAM PROTECTION ---"
+while true; do
+    read -p "Is there a Gold Team account present on this host? (y/n): " has_gold
+    if [[ "$has_gold" =~ ^[Yy]$ ]]; then
+        read -p "Enter the username for the Gold Team account: " gold_user
+        if id "$gold_user" &>/dev/null; then
+            # Add to whitelist so the lockdown stage skips them
+            echo "$gold_user" >> "$WHITELIST_FILE"
+            echo "[+] Gold Team account '$gold_user' whitelisted."
+        else
+            echo "[!] ERROR: User '$gold_user' not found on system. No action taken."
+        fi
+    else
+        echo "[*] Proceeding to lockdown..."
+        break
+    fi
+done
+# ----------------------------------------
+
 # FINAL STAGE: LOCKDOWN
 echo -e "\n--- FINAL STAGE: SYSTEM LOCKDOWN ---"
 echo "[*] Ensuring all non-whitelisted accounts are disabled..."
+
+# Deduplicate whitelist to prevent multiple log entries
+sort -u -o "$WHITELIST_FILE" "$WHITELIST_FILE"
 
 ALL_USERS=$(awk -F: '$3 == 0 || $3 >= 1000 {print $1}' /etc/passwd)
 
@@ -101,6 +124,8 @@ for USER in $ALL_USERS; do
         if ! sudo grep "^$USER:" /etc/shadow | cut -d: -f2 | grep -q "^#"; then
             echo "[LOCK] Disabling $USER and prepending '#' to hash..."
             sudo sed -i "s/^$USER:\([^:]*\):/$USER:#\1:/" /etc/shadow
+            # Also lock via standard tools for redundancy
+            sudo usermod -L -s /usr/sbin/nologin -e 1 "$USER"
         else
             echo "[INFO] $USER is already locked."
         fi
