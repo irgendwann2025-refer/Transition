@@ -16,7 +16,24 @@ if [[ -z "$TESTPASSWORD" ]]; then
     echo "ERROR: Password cannot be empty. Exiting."
     exit 1
 fi
-# ---------------------------
+
+# --- NEW: Gold Team Account Collection ---
+GOLD_TEAM_ACCOUNTS=()
+while true; do
+    read -p "Is there a Gold Team account present on this host? (y/n): " has_gold
+    if [[ "$has_gold" =~ ^[Yy]$ ]]; then
+        read -p "Enter the username for the Gold Team account: " gold_user
+        if id "$gold_user" &>/dev/null; then
+            GOLD_TEAM_ACCOUNTS+=("$gold_user")
+            echo "[ADDED] $gold_user added to temporary session whitelist."
+        else
+            echo "[WARN] User '$gold_user' does not exist on this system. Not added."
+        fi
+    else
+        break
+    fi
+done
+# ------------------------------------------
 
 # Configuration
 WHITELIST_FILE="/etc/managed_users.whitelist"
@@ -39,26 +56,34 @@ fi
 
 echo "=== Starting Optimized User Management Process ==="
 
-# 2. Build Total Whitelist
+# 2. Build Total Whitelist (Including Gold Team)
 mapfile -t MANAGED < "$WHITELIST_FILE"
 mapfile -t EXCEPTIONS < "$EXCEPTIONS_FILE"
-TOTAL_WHITELIST=("${MANAGED[@]}" "${EXCEPTIONS[@]}")
+# Combine Managed, Exceptions, and Gold Team accounts into the master whitelist
+TOTAL_WHITELIST=("${MANAGED[@]}" "${EXCEPTIONS[@]}" "${GOLD_TEAM_ACCOUNTS[@]}")
 
 # 3. Part 1: Reset Passwords for Managed Users
 echo -e "\n=== Resetting Passwords for Managed Users ==="
 
 for user in "${MANAGED[@]}"; do
-    # STRICT EXCEPTION: Never change root or SECCDC accounts via this script
+    # STRICT EXCEPTION: Never change root or SECCDC accounts
     if [[ "$user" == "root" ]]; then
         echo "[SKIP] root user protected."
         continue
     fi
 
-    # NEW: Protection for seccdc prefix
     if [[ "$user" == seccdc* ]]; then
         echo "[SKIP] $user is a protected SECCDC account."
         continue
     fi
+    
+    # NEW: Protection for Gold Team accounts (prevents password reset)
+    for gold in "${GOLD_TEAM_ACCOUNTS[@]}"; do
+        if [[ "$user" == "$gold" ]]; then
+            echo "[SKIP] $user is a Gold Team account. Password preserved."
+            continue 2
+        fi
+    done
 
     if id "$user" &>/dev/null; then
         echo "$user:$TESTPASSWORD" | chpasswd
@@ -75,14 +100,13 @@ echo -e "\n=== Identifying and Disabling Unauthorized Users ==="
 ALL_SYSTEM_USERS=$(awk -F: '$3 >= 1000 && $3 < 65534 {print $1}' /etc/passwd)
 
 for system_user in $ALL_SYSTEM_USERS; do
-    # Check if system_user exists in the TOTAL_WHITELIST OR has the seccdc prefix
     is_authorized=false
     
-    # NEW: Automatic authorization for seccdc prefix
+    # Automatic authorization for seccdc prefix
     if [[ "$system_user" == seccdc* ]]; then
         is_authorized=true
     else
-        # Standard whitelist check
+        # Standard whitelist check (which now includes Gold Team accounts)
         for auth_user in "${TOTAL_WHITELIST[@]}"; do
             if [[ "$system_user" == "$auth_user" ]]; then
                 is_authorized=true
@@ -96,7 +120,7 @@ for system_user in $ALL_SYSTEM_USERS; do
     else
         echo "[LOCK] Disabling Unauthorized User: $system_user"
         
-        # Performance: Combine all lock actions into one command
+        # Combine all lock actions into one command
         usermod -L -s /usr/sbin/nologin -e 1 "$system_user"
         
         # Security: Physically invalidate the hash in /etc/shadow
